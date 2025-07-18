@@ -1,4 +1,5 @@
 import torch, os, json
+import torch.nn.functional as F
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, VideoDataset, ModelLogger, launch_training_task, wan_parser
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -14,6 +15,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
+        dpo=False,
+        dpo_beta=0.1,
+        chosen_key="chosen",
+        rejected_key="rejected",
     ):
         super().__init__()
         # Load models
@@ -45,9 +50,13 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
+        self.dpo = dpo
+        self.dpo_beta = dpo_beta
+        self.chosen_key = chosen_key
+        self.rejected_key = rejected_key
         
         
-    def forward_preprocess(self, data):
+    def forward_preprocess(self, data, video_key="video"):
         # CFG-sensitive parameters
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {}
@@ -56,10 +65,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
-            "input_video": data["video"],
-            "height": data["video"][0].size[1],
-            "width": data["video"][0].size[0],
-            "num_frames": len(data["video"]),
+            "input_video": data[video_key],
+            "height": data[video_key][0].size[1],
+            "width": data[video_key][0].size[0],
+            "num_frames": len(data[video_key]),
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -74,9 +83,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         # Extra inputs
         for extra_input in self.extra_inputs:
             if extra_input == "input_image":
-                inputs_shared["input_image"] = data["video"][0]
+                inputs_shared["input_image"] = data[video_key][0]
             elif extra_input == "end_image":
-                inputs_shared["end_image"] = data["video"][-1]
+                inputs_shared["end_image"] = data[video_key][-1]
             else:
                 inputs_shared[extra_input] = data[extra_input]
         
@@ -87,15 +96,35 @@ class WanTrainingModule(DiffusionTrainingModule):
     
     
     def forward(self, data, inputs=None):
-        if inputs is None: inputs = self.forward_preprocess(data)
-        models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
-        loss = self.pipe.training_loss(**models, **inputs)
-        return loss
+        if not self.dpo:
+            if inputs is None:
+                inputs = self.forward_preprocess(data)
+            models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
+            loss = self.pipe.training_loss(**models, **inputs)
+            return loss
+        else:
+            chosen_inputs = self.forward_preprocess({
+                "prompt": data["prompt"],
+                self.chosen_key: data[self.chosen_key]
+            }, video_key=self.chosen_key)
+            rejected_inputs = self.forward_preprocess({
+                "prompt": data["prompt"],
+                self.rejected_key: data[self.rejected_key]
+            }, video_key=self.rejected_key)
+
+            models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
+            loss_chosen = self.pipe.training_loss(**models, **chosen_inputs)
+            loss_rejected = self.pipe.training_loss(**models, **rejected_inputs)
+            advantage = loss_rejected - loss_chosen
+            dpo_loss = -F.logsigmoid(self.dpo_beta * advantage)
+            return dpo_loss
 
 
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    if args.dpo:
+        args.data_file_keys = f"{args.chosen_video_key},{args.rejected_video_key}"
     dataset = VideoDataset(args=args)
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -106,6 +135,10 @@ if __name__ == "__main__":
         lora_rank=args.lora_rank,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
+        dpo=args.dpo,
+        dpo_beta=args.dpo_beta,
+        chosen_key=args.chosen_video_key,
+        rejected_key=args.rejected_video_key,
     )
     model_logger = ModelLogger(
         args.output_path,

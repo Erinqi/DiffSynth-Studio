@@ -9,4 +9,9 @@ accelerate launch examples/wanvideo/model_training/train.py \
   --num_epochs 2 \
   --remove_prefix_in_ckpt "pipe.dit." \
   --output_path "./models/train/Wan2.1-T2V-1.3B_full" \
-  --trainable_models "dit"
+  --trainable_models "dit" \
+  --dpo \
+  --chosen_video_key chosen \
+  --rejected_video_key rejected \
+  --dpo_beta 0.1
+
